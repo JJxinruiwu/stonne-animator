@@ -13,6 +13,7 @@
 #include "DataPackage.h"
 #include "Stats.h"
 #include <assert.h>
+#include <cstdio>
 #include "ReduceNetwork.h"
 #include "MultiplierNetwork.h"
 
@@ -37,6 +38,8 @@ public:
    
     virtual void printStats(std::ofstream& out, unsigned int indent) {assert(false);}
     virtual void printEnergy(std::ofstream& out, unsigned int indent) {assert(false);}
+    // Sparse-Animator tracing hook (no-op by default)
+    virtual void setTracerFp(FILE* /*fp*/) {}
 };
 
 

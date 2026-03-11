@@ -2,6 +2,7 @@
 #define STONNEMODEL_H_
 
 #include <string>
+#include <cstdio>
 //#include "RSNetwork.h"
 #include "MSNetwork.h"
 #include "DSNetworkTop.h"
@@ -70,9 +71,11 @@ private:
     void testMemory(unsigned int num_ms);
 
     //Statistics
-    unsigned int n_cycles;   
+    unsigned int n_cycles;
 
-   
+    // Sparse-Animator tracing
+    FILE* _sa_fp = nullptr;
+
 public:
     Stonne (Config stonne_cfg);
     ~Stonne();
@@ -117,6 +120,10 @@ public:
                       float MK_sparsity = 0.0f);
 
     void run();
+
+    // Sparse-Animator: call after loadGEMM, before run() to enable cycle tracing.
+    // nnz_mk / nnz_kn: number of non-zeros in MK and KN; 0 = omit from header.
+    void setTracerPath(const char* path, unsigned int nnz_mk = 0, unsigned int nnz_kn = 0);
 
 };
 

@@ -94,6 +94,8 @@ Stonne::Stonne(Config stonne_cfg) {
     //STATISTICS
     this->n_cycles = 0;
 
+    // Sparse-Animator
+    this->_sa_fp = nullptr;
 }
 
 Stonne::~Stonne() {
@@ -108,10 +110,49 @@ Stonne::~Stonne() {
     if(layer_loaded) {
         delete this->dnn_layer;
     }
-  
+
     if(tile_loaded) {
         delete this->current_tile;
-    } 
+    }
+
+    if(_sa_fp) {
+        fclose(_sa_fp);
+        _sa_fp = nullptr;
+    }
+}
+
+void Stonne::setTracerPath(const char* path, unsigned int nnz_mk, unsigned int nnz_kn) {
+    // Must be called after loadGEMM (needs dnn_layer dimensions)
+    assert(this->layer_loaded);
+    _sa_fp = fopen(path, "w");
+    if (!_sa_fp) {
+        std::cerr << "Sparse-Animator: could not open trace file: " << path << std::endl;
+        return;
+    }
+    // MK: rows=M, cols=K; KN: rows=K, cols=N; C: rows=M, cols=N
+    unsigned int M_dim = this->dnn_layer->get_K();
+    unsigned int K_dim = this->dnn_layer->get_S();
+    unsigned int N_dim = this->dnn_layer->get_X();
+
+    // Build matrix specs — include nnz when provided
+    char mk_spec[64], kn_spec[64], c_spec[64];
+    if (nnz_mk > 0)
+        snprintf(mk_spec, sizeof(mk_spec), "{\"rows\":%u,\"cols\":%u,\"nnz\":%u}", M_dim, K_dim, nnz_mk);
+    else
+        snprintf(mk_spec, sizeof(mk_spec), "{\"rows\":%u,\"cols\":%u}", M_dim, K_dim);
+    if (nnz_kn > 0)
+        snprintf(kn_spec, sizeof(kn_spec), "{\"rows\":%u,\"cols\":%u,\"nnz\":%u}", K_dim, N_dim, nnz_kn);
+    else
+        snprintf(kn_spec, sizeof(kn_spec), "{\"rows\":%u,\"cols\":%u}", K_dim, N_dim);
+    snprintf(c_spec,  sizeof(c_spec),  "{\"rows\":%u,\"cols\":%u}", M_dim, N_dim);
+
+    fprintf(_sa_fp,
+            "{\"type\":\"header\",\"accelerator\":\"STONNE-SIGMA\",\"version\":\"1.0\","
+            "\"matrices\":{\"MK\":%s,\"KN\":%s,\"C\":%s},"
+            "\"metadata\":{}}\n",
+            mk_spec, kn_spec, c_spec);
+    fflush(_sa_fp);
+    this->mem->setTracerFp(_sa_fp);
 }
 
 //Connecting the DSNetworkTop input ports with the read ports of the memory. These connections have been created

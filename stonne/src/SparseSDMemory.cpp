@@ -2,6 +2,9 @@
 #include "SparseSDMemory.h"
 #include <assert.h>
 #include <iostream>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include "utility.h"
 
 SparseSDMemory::SparseSDMemory(id_t id, std::string name, Config stonne_cfg, Connection* write_connection) : MemoryController(id, name) {
@@ -182,6 +185,11 @@ void SparseSDMemory::cycle() {
     std::vector<DataPackage*> psum_to_send; // psum temporal storage
     this->local_cycle+=1;
     this->sdmemoryStats.total_cycles++; //To track information
+
+    // Sparse-Animator: per-cycle event buffers
+    std::vector<std::string> _sa_events;
+    std::vector<std::string> _sa_tile_events;
+    char _sa_buf[512];
     
     if(current_state==CONFIGURING) {   //If the architecture has not been configured
         int i=sta_current_index_metadata;  //Rows
@@ -360,7 +368,20 @@ void SparseSDMemory::cycle() {
 	//std::cout << "End configuring" << std::endl;
 	//Number of psums to calculate in this iteration
 	this->output_size_iteration=this->configurationVNs.size()*this->dim_str;
-	
+
+	// Sparse-Animator: emit tile-level processing events for the configured VN rows
+	if (_sa_fp && dataflow == MK_STA_KN_STR) {
+	    for (int vi = 0; vi < (int)configurationVNs.size(); vi++) {
+	        int mk_row = (int)sta_current_index_metadata + vi;
+	        snprintf(_sa_buf, sizeof(_sa_buf),
+	                 "{\"matrix\":\"MK\",\"kind\":\"processing\",\"tile\":[%d,0]}", mk_row);
+	        _sa_tile_events.push_back(std::string(_sa_buf));
+	    }
+	    snprintf(_sa_buf, sizeof(_sa_buf),
+	             "{\"matrix\":\"C\",\"kind\":\"processing\",\"tile\":[%d,0]}",
+	             (int)sta_current_index_metadata);
+	    _sa_tile_events.push_back(std::string(_sa_buf));
+	}
 
     }
 
@@ -368,7 +389,7 @@ void SparseSDMemory::cycle() {
        //Distribution of the stationary matrix
        unsigned int dest = 0; //MS destination
        unsigned int sub_address = 0;
-    
+
        for(int i=0; i<this->configurationVNs.size(); i++) {
 	   int j=0;
 	   if(this->configurationVNs[i].getFolding()) {
@@ -379,12 +400,36 @@ void SparseSDMemory::cycle() {
 	       //Accessing to memory
 	       data_t data = this->STA_address[sta_current_index_matrix+sub_address]; //In both dataflows adjacents elements are consecutive in mem
 	       sdmemoryStats.n_SRAM_weight_reads++;
-	       this->n_ones_sta_matrix++; 
+	       this->n_ones_sta_matrix++;
 	       DataPackage* pck_to_send = new DataPackage(sizeof(data_t), data, WEIGHT, 0, UNICAST, dest);
 	       this->sendPackageToInputFifos(pck_to_send);
                dest++;
 	       sub_address++;
 	   }
+       }
+
+       // Sparse-Animator: emit MK element read events
+       if (_sa_fp && dataflow == MK_STA_KN_STR) {
+           int j_start = (int)sta_current_j_metadata;
+           int j_end   = (int)sta_last_j_metadata;
+           for (int vi = 0; vi < (int)configurationVNs.size(); vi++) {
+               int base_row = (int)sta_current_index_metadata + vi;
+               std::string coords;
+               bool first_coord = true;
+               for (int k = j_start; k < j_end; k++) {
+                   if (STA_metadata[base_row * (int)STA_DIST_VECTOR + k * (int)STA_DIST_ELEM]) {
+                       if (!first_coord) coords += ",";
+                       snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", base_row, k);
+                       coords += _sa_buf;
+                       first_coord = false;
+                   }
+               }
+               if (!first_coord) {
+                   snprintf(_sa_buf, sizeof(_sa_buf),
+                            "{\"matrix\":\"MK\",\"kind\":\"read\",\"coords\":[%s]}", coords.c_str());
+                   _sa_events.push_back(std::string(_sa_buf));
+               }
+           }
        }
 
     }
@@ -442,7 +487,54 @@ void SparseSDMemory::cycle() {
          DataPackage* pck = new DataPackage(sizeof(data_t), data,IACTIVATION,0, MULTICAST, destinations, this->num_ms);
 
 	 this->sendPackageToInputFifos(pck);
-       } 
+       }
+
+       // Sparse-Animator: emit KN read and C MAC events
+       if (_sa_fp && dataflow == MK_STA_KN_STR) {
+           int cur_col  = (int)str_current_index;
+           int init_j   = (int)sta_current_j_metadata;
+           int end_j    = (int)sta_last_j_metadata;
+           int first_sta = (int)sta_current_index_metadata;
+           int last_sta  = first_sta + (int)configurationVNs.size();
+
+           // KN element reads
+           std::string kn_coords;
+           bool kn_first = true;
+           for (int j = init_j; j < end_j; j++) {
+               if (STR_metadata[cur_col * (int)STR_DIST_VECTOR + j * (int)STR_DIST_ELEM]) {
+                   if (!kn_first) kn_coords += ",";
+                   snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", j, cur_col);
+                   kn_coords += _sa_buf;
+                   kn_first = false;
+               }
+           }
+           if (!kn_first) {
+               snprintf(_sa_buf, sizeof(_sa_buf),
+                        "{\"matrix\":\"KN\",\"kind\":\"read\",\"coords\":[%s]}", kn_coords.c_str());
+               _sa_events.push_back(std::string(_sa_buf));
+           }
+
+           // C MAC events
+           std::string c_coords;
+           bool c_first = true;
+           for (int j = init_j; j < end_j; j++) {
+               if (STR_metadata[cur_col * (int)STR_DIST_VECTOR + j * (int)STR_DIST_ELEM]) {
+                   for (int row = first_sta; row < last_sta; row++) {
+                       if (STA_metadata[row * (int)STA_DIST_VECTOR + j * (int)STA_DIST_ELEM]) {
+                           if (!c_first) c_coords += ",";
+                           snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", row, cur_col);
+                           c_coords += _sa_buf;
+                           c_first = false;
+                       }
+                   }
+               }
+           }
+           if (!c_first) {
+               snprintf(_sa_buf, sizeof(_sa_buf),
+                        "{\"matrix\":\"C\",\"kind\":\"mac\",\"coords\":[%s]}", c_coords.c_str());
+               _sa_events.push_back(std::string(_sa_buf));
+           }
+       }
 
        str_current_index++;
     }
@@ -459,8 +551,15 @@ void SparseSDMemory::cycle() {
             unsigned int vn = pck_received->get_vn();
             data_t data = pck_received->get_data();
             this->sdmemoryStats.n_SRAM_psum_writes++; //To track information 
-	    unsigned int addr_offset = (sta_current_index_metadata+vn)*OUT_DIST_VN + vnat_table[vn]*OUT_DIST_VN_ITERATION; 
-	    vnat_table[vn]++; 
+	    unsigned int addr_offset = (sta_current_index_metadata+vn)*OUT_DIST_VN + vnat_table[vn]*OUT_DIST_VN_ITERATION;
+	    // Sparse-Animator: emit C write event
+	    if (_sa_fp && dataflow == MK_STA_KN_STR) {
+	        snprintf(_sa_buf, sizeof(_sa_buf),
+	                 "{\"matrix\":\"C\",\"kind\":\"write\",\"coords\":[[%d,%d]],\"meta\":{\"partial\":true}}",
+	                 (int)(sta_current_index_metadata + vn), (int)vnat_table[vn]);
+	        _sa_events.push_back(std::string(_sa_buf));
+	    }
+	    vnat_table[vn]++;
             this->output_address[addr_offset]=data; //ofmap or psum, it does not matter.
             current_output++;
 	    current_output_iteration++;
@@ -542,6 +641,26 @@ void SparseSDMemory::cycle() {
 
 
     
+
+    // Sparse-Animator: emit one JSONL cycle record
+    if (_sa_fp) {
+        fprintf(_sa_fp, "{\"type\":\"cycle\",\"cycle\":%u,\"events\":[", _sa_cycle++);
+        for (int i = 0; i < (int)_sa_events.size(); i++) {
+            if (i > 0) fprintf(_sa_fp, ",");
+            fprintf(_sa_fp, "%s", _sa_events[i].c_str());
+        }
+        fprintf(_sa_fp, "]");
+        if (!_sa_tile_events.empty()) {
+            fprintf(_sa_fp, ",\"tile_events\":[");
+            for (int i = 0; i < (int)_sa_tile_events.size(); i++) {
+                if (i > 0) fprintf(_sa_fp, ",");
+                fprintf(_sa_fp, "%s", _sa_tile_events[i].c_str());
+            }
+            fprintf(_sa_fp, "]");
+        }
+        fprintf(_sa_fp, "}\n");
+        fflush(_sa_fp);
+    }
 
     this->send();
 }
