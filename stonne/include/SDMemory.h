@@ -135,11 +135,18 @@ private:
     unsigned int group_size;
 
     std::list<DataPackage*> packages_created; // Vector used to track the packages and delete them at the end of the execution
-   std::vector<Connection*> write_port_connections; 
+   std::vector<Connection*> write_port_connections;
    VNAT_Register** VNAT;  //VNAT with as many registers as VN configured in the accelerator
    cycles_t local_cycle;
    SDMemoryStats sdmemoryStats; //To track information
-   
+
+   // Sparse-Animator tracing
+   FILE* _sa_fp = nullptr;
+   unsigned int _sa_cycle = 0;
+   std::vector<std::string> _sa_events;
+   std::vector<std::string> _sa_tile_events;
+   char _sa_buf[512];
+
    //Aux functions
    void receive();
    void sendPackageToInputFifos(DataPackage* pck);
@@ -166,6 +173,8 @@ public:
     void printStats(std::ofstream& out, unsigned int indent);
     void printEnergy(std::ofstream& out, unsigned int indent);
     SDMemoryStats getStats() {return this->sdmemoryStats;}
+    void setTracerFp(FILE* fp) override { _sa_fp = fp; }
+    void flushTracer() override;
 };
 
 

@@ -124,10 +124,14 @@ private:
    //For stats
    unsigned int n_ones_sta_matrix;
    unsigned int n_ones_str_matrix;
-   std::vector<Connection*> write_port_connections; 
+   std::vector<Connection*> write_port_connections;
    cycles_t local_cycle;
    SDMemoryStats sdmemoryStats; //To track information
-   
+
+   // Sparse-Animator tracing
+   FILE* _sa_fp = nullptr;
+   unsigned int _sa_cycle = 0;
+
    //Aux functions
    void receive();
    void send();
@@ -154,6 +158,7 @@ public:
     void printEnergy(std::ofstream& out, unsigned int indent);
     void setClocking(unsigned int* clocked_op){this->clocked_op=clocked_op;}
     SDMemoryStats getStats() {return this->sdmemoryStats;}
+    void setTracerFp(FILE* fp) override { _sa_fp = fp; }
 
 };
 

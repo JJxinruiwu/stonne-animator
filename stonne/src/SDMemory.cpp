@@ -1,6 +1,7 @@
 // Created by Francisco Munoz Martinez on 02/07/2019
 
 #include "SDMemory.h"
+#include "SparseAnimatorHook.h"
 #include <assert.h>
 #include <iostream>
 #include "utility.h"
@@ -333,6 +334,24 @@ void SDMemory::cycle() {
     std::vector<DataPackage*> psum_to_send; // psum temporal storage
     this->local_cycle+=1;
     this->sdmemoryStats.total_cycles++; //To track information
+
+    // Sparse-Animator: clear per-cycle event buffers (class members)
+    _sa_events.clear();
+    _sa_tile_events.clear();
+    // Trace only GEMM/FC workloads; CONV coord mapping is too complex
+    // to decode from addr offsets alone.
+    Layer_t _sa_layer_type = dnn_layer->get_layer_type();
+    bool _sa_is_gemm = (_sa_fp &&
+        (_sa_layer_type == GEMM || _sa_layer_type == FC));
+    // Set up global MAC hook for MSwitch so multiplies emit events here
+    if (_sa_is_gemm && this->tile_loaded) {
+        g_sa_hook.events   = &_sa_events;
+        g_sa_hook.base_row = (int)(this->current_X * this->current_tile->get_T_X_());
+        g_sa_hook.base_col = (int)(this->current_K * this->current_tile->get_T_K());
+        g_sa_hook.n_cols   = (int)(this->current_tile->get_T_K());
+    } else {
+        g_sa_hook.events = nullptr;
+    }
     /* CHANGES DONE TO SAVE MEMORY */
     unsigned int current_iteration=current_output_pixel / output_psums_per_channel;
     unsigned index_G=current_G*this->current_tile->get_T_G();
@@ -348,6 +367,10 @@ void SDMemory::cycle() {
             window_size+=1;
             folding_shift+=1;
         }
+        // Sparse-Animator: accumulate KN read coords for weight distribution
+        std::string _sa_kn_coords;
+        bool _sa_kn_first = true;
+
         if(!this->weights_distributed) {
             //For each weight, decide the receivers
             if(current_tile->get_T_N()*current_tile->get_T_X_()*current_tile->get_T_Y_() > 1) { //If N*X_*Y_ is greater than 1 then MULTICAST MESSAGE as the same weight is sent multiple times.
@@ -389,9 +412,17 @@ void SDMemory::cycle() {
 				    if(((index_R+r) < this->dnn_layer->get_R()) && ((index_S+s) < this->dnn_layer->get_S()) && ((index_C+c) < this->dnn_layer->get_C()) && ((index_K+k) < this->dnn_layer->get_K())) { //Zero-remainder constaint removed
 				    this->sdmemoryStats.n_SRAM_weight_reads++;
                                     data = filter_address[(index_G+g)*this->group_size*word_size + (index_K+k)*this->filter_size*word_size + (index_R+r)*this->row_filter_size*word_size + (index_S+s)*dnn_layer->get_C()*word_size + (index_C+c)];  //Fetching. Note the distribution in memory is interleaving the channels
+				    // Sparse-Animator: KN[k_gemm, n_gemm] = KN[S, K_cnn]
+				    if (_sa_is_gemm) {
+				        if (!_sa_kn_first) _sa_kn_coords += ",";
+				        snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]",
+				                 (int)(index_S+s), (int)(index_K+k));
+				        _sa_kn_coords += _sa_buf;
+				        _sa_kn_first = false;
+				    }
 				    }
 
-                           
+
                                     //Creating the package with the weight and the destination vector
                                     DataPackage* pck_to_send = new DataPackage(sizeof(data_t), data, WEIGHT, 0, MULTICAST, vector_to_send, this->num_ms);
                                     //index_K*this->current_tile->get_T_G() because even though index_K iterations have been calculated previously, there are G groups mapped, so really real index_K*T_G
@@ -423,10 +454,18 @@ void SDMemory::cycle() {
 				    if(((index_R+r) < this->dnn_layer->get_R()) && ((index_S+s) < this->dnn_layer->get_S()) && ((index_C+c) < this->dnn_layer->get_C()) && ((index_K+k) < this->dnn_layer->get_K())) { //Zero-remainder constaint removed
 				    this->sdmemoryStats.n_SRAM_weight_reads++;
 
-                                    data = filter_address[(index_G+g)*this->group_size*word_size + (index_K+k)*this->filter_size*word_size + 
+                                    data = filter_address[(index_G+g)*this->group_size*word_size + (index_K+k)*this->filter_size*word_size +
 				        + (index_R+r)*this->row_filter_size*word_size + (index_S+s)*dnn_layer->get_C()*word_size + (index_C+c)];
+				    // Sparse-Animator: KN[k_gemm, n_gemm] = KN[S, K_cnn]
+				    if (_sa_is_gemm) {
+				        if (!_sa_kn_first) _sa_kn_coords += ",";
+				        snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]",
+				                 (int)(index_S+s), (int)(index_K+k));
+				        _sa_kn_coords += _sa_buf;
+				        _sa_kn_first = false;
 				    }
-                                    
+				    }
+
 			            //Shift of this weight is g*group_tile_size + k*filter_tile_size + c*filter_channel_tile_size + r*s_tile_size + s
 			            unsigned int receiver = g*current_tile->get_T_K()*window_size  + k*window_size + 
 			    	               c*current_tile->get_T_R()*current_tile->get_T_S() + r*current_tile->get_T_S() + s + folding_shift; //+1 because of the ms we leave free for the folding
@@ -458,8 +497,14 @@ void SDMemory::cycle() {
                 }
             }
         
+            // Sparse-Animator: emit KN read event
+            if (_sa_is_gemm && !_sa_kn_first) {
+                snprintf(_sa_buf, sizeof(_sa_buf),
+                         "{\"matrix\":\"KN\",\"kind\":\"read\",\"coords\":[%s]}", _sa_kn_coords.c_str());
+                _sa_events.push_back(std::string(_sa_buf));
+            }
         } // if(!this->weights_distributed)
-        else { //Input distributions. 
+        else { //Input distributions.
             //std::cout << "Sending inputs in the cycle " << this->local_cycle << std::endl;
             unsigned y_inputs = this->current_tile->get_T_S() + (this->current_tile->get_T_Y_()-1)*this->dnn_layer->get_strides(); //Number of input rows per batch of the ifmap obtained from the ofmap dimensions. i.e., filter size + number of extra Y_ Neurons mapped times the extra inputs (stride)
             unsigned x_inputs = this->current_tile->get_T_R() + (this->current_tile->get_T_X_()-1)*(this->dnn_layer->get_strides()); // Nuumber of input cols per batch of the ifmap obtained from the ofmap dimensions
@@ -468,6 +513,9 @@ void SDMemory::cycle() {
 
             unsigned output_y_inputs = this->current_tile->get_T_Y_() + (this->dnn_layer->get_S()-1);
             unsigned output_x_inputs = this->current_tile->get_T_X_() + (this->dnn_layer->get_R()-1);
+            // Sparse-Animator: accumulate MK read coords for input distribution
+            std::string _sa_mk_coords;
+            bool _sa_mk_first = true;
             //std::cout << "y_inputs: " << y_inputs << std::endl;
             //std::cout << "x_inputs: " << x_inputs << std::endl;
             //y_init is the first column of the window to send. This might be 0, if all the window must be sent,
@@ -602,6 +650,14 @@ void SDMemory::cycle() {
 				if(((index_R+x) < output_x_inputs) && ((index_S+y) < (output_y_inputs)) && ((index_C+c) < this->dnn_layer->get_C())) { //Zero-remainder constaint removed
                                 this->sdmemoryStats.n_SRAM_input_reads++;
                                 data = input_address[(index_N+i)*this->input_size+((index_X*this->dnn_layer->get_strides()+ x) + index_R)*this->dnn_layer->get_Y()*this->dnn_layer->get_C()*this->dnn_layer->get_G()*word_size+((index_Y*this->dnn_layer->get_strides() + y) + index_S)*this->dnn_layer->get_C()*this->dnn_layer->get_G()*word_size + (index_G+g)*dnn_layer->get_C()*word_size + (index_C+c)*word_size]; //Read value input(x,y)
+				// Sparse-Animator: MK[m_gemm, k_gemm] = MK[X, S]
+				if (_sa_is_gemm) {
+				    if (!_sa_mk_first) _sa_mk_coords += ",";
+				    snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]",
+				             (int)(index_X+x), (int)(index_S+y));
+				    _sa_mk_coords += _sa_buf;
+				    _sa_mk_first = false;
+				}
 
 				}
                                 //Creating multicast package. Even though the package was unicast, multicast format is used anyway with just one element true in the destination vector
@@ -619,7 +675,15 @@ void SDMemory::cycle() {
                 } 
             }
 
-            //TODO iter_X deberia de ser iter_X de inputs, no?         
+            // Sparse-Animator: emit MK read event
+            // MAC events are emitted directly from MSwitch::cycle() via g_sa_hook.
+            if (_sa_is_gemm && !_sa_mk_first) {
+                snprintf(_sa_buf, sizeof(_sa_buf),
+                         "{\"matrix\":\"MK\",\"kind\":\"read\",\"coords\":[%s]}", _sa_mk_coords.c_str());
+                _sa_events.push_back(std::string(_sa_buf));
+            }
+
+            //TODO iter_X deberia de ser iter_X de inputs, no?
             //Updating variables
             this->current_S+=1;
             if(this->current_S == this->iter_S) {
@@ -697,9 +761,17 @@ void SDMemory::cycle() {
             assert(vn==VNAT[vn]->VN);
             //std::cout << "Memory received a psum " << data << std::endl;
             unsigned int addr_offset = this->VNAT[vn]->addr;
-	    if(this->VNAT[vn]->valid_value) { 
-                this->sdmemoryStats.n_SRAM_psum_writes++; //To track information 
+	    if(this->VNAT[vn]->valid_value) {
+                this->sdmemoryStats.n_SRAM_psum_writes++; //To track information
                 this->output_address[addr_offset]=data; //ofmap or psum, it does not matter.
+                // Sparse-Animator: emit C write event
+                if (_sa_is_gemm) {
+                    unsigned K_dim = this->dnn_layer->get_K();
+                    snprintf(_sa_buf, sizeof(_sa_buf),
+                             "{\"matrix\":\"C\",\"kind\":\"write\",\"coords\":[[%d,%d]]}",
+                             (int)(addr_offset / K_dim), (int)(addr_offset % K_dim));
+                    _sa_events.push_back(std::string(_sa_buf));
+                }
 	    }
             //std::cout << "value written " << data << std::endl;
             current_output_pixel+=1; 
@@ -745,10 +817,33 @@ void SDMemory::cycle() {
         }
     }
 
-    //Introducing temporal data to send to the FIFOs used to send 
-
-
+    //Introducing temporal data to send to the FIFOs used to send
     this->send(); //Send the content in read_fifo according to the current bw
+    // JSONL flush deferred to flushTracer() so MSwitch MAC events are included.
+}
+
+void SDMemory::flushTracer() {
+    // Called by Stonne::cycle() after msnet->cycle() so MAC events from
+    // MSwitch::cycle() (injected via g_sa_hook) are in _sa_events before we write.
+    g_sa_hook.events = nullptr; // prevent stale writes after this cycle
+    if (_sa_fp) {
+        fprintf(_sa_fp, "{\"type\":\"cycle\",\"cycle\":%u,\"events\":[", _sa_cycle++);
+        for (int i = 0; i < (int)_sa_events.size(); i++) {
+            if (i > 0) fprintf(_sa_fp, ",");
+            fprintf(_sa_fp, "%s", _sa_events[i].c_str());
+        }
+        fprintf(_sa_fp, "]");
+        if (!_sa_tile_events.empty()) {
+            fprintf(_sa_fp, ",\"tile_events\":[");
+            for (int i = 0; i < (int)_sa_tile_events.size(); i++) {
+                if (i > 0) fprintf(_sa_fp, ",");
+                fprintf(_sa_fp, "%s", _sa_tile_events[i].c_str());
+            }
+            fprintf(_sa_fp, "]");
+        }
+        fprintf(_sa_fp, "}\n");
+        fflush(_sa_fp);
+    }
 }
 
 bool SDMemory::isExecutionFinished() {

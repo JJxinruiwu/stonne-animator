@@ -94,10 +94,19 @@ private:
    unsigned int output_size_iteration;
 
    //For stats
-   std::vector<Connection*> write_port_connections; 
+   std::vector<Connection*> write_port_connections;
    cycles_t local_cycle;
    SDMemoryStats sdmemoryStats; //To track information
-   
+
+   // Sparse-Animator tracing
+   FILE* _sa_fp = nullptr;
+   unsigned int _sa_cycle = 0;
+   std::vector<std::string> _sa_events;
+   std::vector<std::string> _sa_tile_events;
+   char _sa_buf[512];
+   int _sa_tile_base_row = 0; // latched at OS_CONFIGURING; stable through pipeline drain
+   int _sa_tile_base_col = 0;
+
    //Aux functions
    void receive();
    void send();
@@ -122,6 +131,8 @@ public:
     void setMultiplierNetwork(MultiplierNetwork* multiplier_network) {this->multiplier_network = multiplier_network;}
     void printStats(std::ofstream& out, unsigned int indent);
     void printEnergy(std::ofstream& out, unsigned int indent);
+    void setTracerFp(FILE* fp) override { _sa_fp = fp; }
+    void flushTracer() override;
 };
 
 

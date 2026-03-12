@@ -1,7 +1,9 @@
 //Created by Francisco Munoz-Martinez on 13/06/2019
 
 #include "MultiplierOS.h"
+#include "SparseAnimatorHook.h"
 #include <assert.h>
+#include <cstdio>
 #include "utility.h"
 /*
 */
@@ -236,6 +238,15 @@ void MultiplierOS::cycle() { //Computing a cycle
             
             DataPackage* weight = top_fifo->pop(); //get the weight and remove from fifo
             DataPackage* pck_result = perform_operation_2_operands(activation, weight); //Creating the psum package
+            // Sparse-Animator: emit MAC event at the actual multiply site
+            if (g_sa_hook.events) {
+                char _sa_buf[128];
+                int row = g_sa_hook.base_row + this->row_num;
+                int col = g_sa_hook.base_col + this->col_num;
+                snprintf(_sa_buf, sizeof(_sa_buf),
+                         "{\"matrix\":\"C\",\"kind\":\"mac\",\"coords\":[[%d,%d]]}", row, col);
+                g_sa_hook.events->push_back(std::string(_sa_buf));
+            }
             accbuffer_fifo->push(pck_result); //Sending to the accbuffer to be accumulated in OS manner
 
 	    //Forwarding the weight and the activation

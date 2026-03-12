@@ -40,6 +40,9 @@ public:
     virtual void printEnergy(std::ofstream& out, unsigned int indent) {assert(false);}
     // Sparse-Animator tracing hook (no-op by default)
     virtual void setTracerFp(FILE* /*fp*/) {}
+    // Called by Stonne::cycle() after msnet->cycle() so MAC events from multipliers
+    // can be collected before the JSONL line is written (no-op by default).
+    virtual void flushTracer() {}
 };
 
 

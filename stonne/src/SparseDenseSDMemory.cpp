@@ -151,10 +151,16 @@ void SparseDenseSDMemory::cycle() {
     //std::vector<DataPackage*> psum_to_send; // psum temporal storage
     this->local_cycle+=1;
     this->sdmemoryStats.total_cycles++; //To track information
+
+    // Sparse-Animator: per-cycle event buffers
+    std::vector<std::string> _sa_events;
+    std::vector<std::string> _sa_tile_events;
+    char _sa_buf[512];
+
     if(current_state==CONFIGURING)
     {	//Initialize these for the first time
     	this->K_nnz=MK_row_pointer[current_M+1]-MK_row_pointer[current_M];
-    	this->STA_base = MK_row_pointer[current_M];			
+    	this->STA_base = MK_row_pointer[current_M];
     	this->iter_K = K_nnz/T_K + (K_nnz%T_K!=0);
 	//std::cout << "Starting to compute output row " << current_M << "/" << M << std::endl;
 	
@@ -165,6 +171,16 @@ void SparseDenseSDMemory::cycle() {
 	this->reduce_network->configureSignals(tile1, this->dnn_layer, this->num_ms, this->iter_K);
 	this->current_K_nnz = 0;
 	STA_complete=false;
+
+	// Sparse-Animator: emit tile-level processing events
+	if (_sa_fp) {
+	    snprintf(_sa_buf, sizeof(_sa_buf),
+	             "{\"matrix\":\"MK\",\"kind\":\"processing\",\"tile\":[%d,0]}", (int)current_M);
+	    _sa_tile_events.push_back(std::string(_sa_buf));
+	    snprintf(_sa_buf, sizeof(_sa_buf),
+	             "{\"matrix\":\"C\",\"kind\":\"processing\",\"tile\":[%d,0]}", (int)current_M);
+	    _sa_tile_events.push_back(std::string(_sa_buf));
+	}
     }
 //    if(current_state==CONFIGURING) {   //If the architecture has not been configured
 //        //int i=sta_current_index_metadata;  //Rows
@@ -358,8 +374,11 @@ void SparseDenseSDMemory::cycle() {
        //Distribution of the stationary matrix
        unsigned int dest = 0; //MS destination
        unsigned int index_K = current_K_nnz*T_K;
-      
-    
+
+       // Sparse-Animator: accumulate MK read coords
+       std::string _sa_mk_coords;
+       bool _sa_mk_first = true;
+
 //       for(int i=0; i<this->configurationVNs.size(); i++) {
 //	   int j=0;
 //	   if(this->configurationVNs[i].getFolding()) {
@@ -370,9 +389,16 @@ void SparseDenseSDMemory::cycle() {
 	       data_t data;//Accessing to memory
 	       if(index_K<K_nnz)
 	       {					//This may solve zero remainder constraint too
-	       	     data = this->MK_address[STA_base+index_K]; 
+	       	     data = this->MK_address[STA_base+index_K];
 	       	     sdmemoryStats.n_SRAM_weight_reads++;
 	       	     this->n_ones_sta_matrix++;
+	       	     // Sparse-Animator: collect MK read coord
+	       	     if (_sa_fp) {
+	       	         if (!_sa_mk_first) _sa_mk_coords += ",";
+	       	         snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", (int)current_M, (int)MK_col_id[STA_base + index_K]);
+	       	         _sa_mk_coords += _sa_buf;
+	       	         _sa_mk_first = false;
+	       	     }
 	       }
 	       else
 	       {
@@ -391,18 +417,30 @@ void SparseDenseSDMemory::cycle() {
 	       index_K++;
 	   }
        //}
-       
+
+       // Sparse-Animator: emit MK read event
+       if (_sa_fp && !_sa_mk_first) {
+           snprintf(_sa_buf, sizeof(_sa_buf),
+                    "{\"matrix\":\"MK\",\"kind\":\"read\",\"coords\":[%s]}", _sa_mk_coords.c_str());
+           _sa_events.push_back(std::string(_sa_buf));
+       }
+
        this->current_K_nnz+=1;
             if(this->current_K_nnz == this->iter_K) {
                 this->current_K_nnz = 0;
                 this->STA_complete=true;
                 }
-    
+
     }
 
     else if(current_state == DIST_STR_MATRIX) {//Dense matrix
        unsigned int dest=0;
        unsigned int index_N=current_N*T_N;
+
+       // Sparse-Animator: accumulate KN read and C mac coords
+       std::string _sa_kn_coords, _sa_c_coords;
+       bool _sa_kn_first = true, _sa_c_first = true;
+
        for(int i=0;i<T_N;i++)
        {
         unsigned int index_K=current_K_nnz*T_K;
@@ -414,7 +452,19 @@ void SparseDenseSDMemory::cycle() {
 		     if(index_N < N) {  //Zero-remainder constraint for N-dim
 	       	         data = this->KN_address[MK_col_id[STA_base+index_K]*N+index_N]; //Row of the dense matrix is indexed by the col id of sparse matrix
 			 sdmemoryStats.n_SRAM_input_reads++;
-
+			 // Sparse-Animator: collect KN read and C mac coords
+			 if (_sa_fp) {
+			     if (!_sa_kn_first) _sa_kn_coords += ",";
+			     snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]",
+			              (int)MK_col_id[STA_base+index_K], (int)index_N);
+			     _sa_kn_coords += _sa_buf;
+			     _sa_kn_first = false;
+			     if (!_sa_c_first) _sa_c_coords += ",";
+			     snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]",
+			              (int)current_M, (int)index_N);
+			     _sa_c_coords += _sa_buf;
+			     _sa_c_first = false;
+			 }
 		     }
 		     else {
                          data = 0.0;
@@ -424,14 +474,26 @@ void SparseDenseSDMemory::cycle() {
 	       {
 	             data = 0.0;
 	       }
-	       
+
 	       DataPackage* pck_to_send = new DataPackage(sizeof(data_t), data, IACTIVATION, 0, UNICAST, dest);
 	       this->sendPackageToInputFifos(pck_to_send);
-	       
+
        		index_K++;
        		dest++;
        	   }
        	   index_N++;
+       }
+
+       // Sparse-Animator: emit KN read and C mac events
+       if (_sa_fp && !_sa_kn_first) {
+           snprintf(_sa_buf, sizeof(_sa_buf),
+                    "{\"matrix\":\"KN\",\"kind\":\"read\",\"coords\":[%s]}", _sa_kn_coords.c_str());
+           _sa_events.push_back(std::string(_sa_buf));
+       }
+       if (_sa_fp && !_sa_c_first) {
+           snprintf(_sa_buf, sizeof(_sa_buf),
+                    "{\"matrix\":\"C\",\"kind\":\"mac\",\"coords\":[%s]}", _sa_c_coords.c_str());
+           _sa_events.push_back(std::string(_sa_buf));
        }
       /* int init_point_str = this->sta_current_j_metadata;
        int end_point_str = this->sta_last_j_metadata;
@@ -564,6 +626,13 @@ void SparseDenseSDMemory::cycle() {
                 this->output_address[addr_offset]=data; //ofmap or psum, it does not matter.
                 //this->clocked_op[addr_offset]=local_cycle;
                 this->sdmemoryStats.n_SRAM_psum_writes++; //To track information
+                // Sparse-Animator: emit C write event
+                if (_sa_fp) {
+                    snprintf(_sa_buf, sizeof(_sa_buf),
+                             "{\"matrix\":\"C\",\"kind\":\"write\",\"coords\":[[%d,%d]]}",
+                             (int)vnat_table_iterm[vn], (int)(vnat_table_itern[vn]*T_N + vn));
+                    _sa_events.push_back(std::string(_sa_buf));
+                }
             }
 
 	    vnat_table_itern[vn]++;
@@ -675,6 +744,26 @@ void SparseDenseSDMemory::cycle() {
 
 
 
+
+    // Sparse-Animator: emit one JSONL cycle record
+    if (_sa_fp) {
+        fprintf(_sa_fp, "{\"type\":\"cycle\",\"cycle\":%u,\"events\":[", _sa_cycle++);
+        for (int i = 0; i < (int)_sa_events.size(); i++) {
+            if (i > 0) fprintf(_sa_fp, ",");
+            fprintf(_sa_fp, "%s", _sa_events[i].c_str());
+        }
+        fprintf(_sa_fp, "]");
+        if (!_sa_tile_events.empty()) {
+            fprintf(_sa_fp, ",\"tile_events\":[");
+            for (int i = 0; i < (int)_sa_tile_events.size(); i++) {
+                if (i > 0) fprintf(_sa_fp, ",");
+                fprintf(_sa_fp, "%s", _sa_tile_events[i].c_str());
+            }
+            fprintf(_sa_fp, "]");
+        }
+        fprintf(_sa_fp, "}\n");
+        fflush(_sa_fp);
+    }
 
     this->send();
 }

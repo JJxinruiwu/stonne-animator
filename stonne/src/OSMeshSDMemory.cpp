@@ -1,5 +1,6 @@
 
 #include "OSMeshSDMemory.h"
+#include "SparseAnimatorHook.h"
 #include <assert.h>
 #include <iostream>
 #include "utility.h"
@@ -116,12 +117,27 @@ void OSMeshSDMemory::cycle() {
     //std::vector<DataPackage*> psum_to_send; // psum temporal storage
     this->local_cycle+=1;
     this->sdmemoryStats.total_cycles++; //To track information
+
+    // Sparse-Animator: clear per-cycle event buffers (class members)
+    _sa_events.clear();
+    _sa_tile_events.clear();
+    // Use latched tile base (set at OS_CONFIGURING) so pipeline-tail MACs don't
+    // pick up the incremented current_M/N of the *next* tile.
+    if (_sa_fp) {
+        g_sa_hook.events   = &_sa_events;
+        g_sa_hook.base_row = _sa_tile_base_row;
+        g_sa_hook.base_col = _sa_tile_base_col;
+        g_sa_hook.n_cols   = 0; // not used: MultiplierOS uses row_num/col_num directly
+    } else {
+        g_sa_hook.events = nullptr;
+    }
+
     if(current_state==OS_CONFIGURING)
     {	//Initialize these for the first time
         this->sdmemoryStats.n_reconfigurations++;
 	unsigned int remaining_M = M - (current_M*T_M);
 	unsigned int remaining_N = N - (current_N*T_N);
-	this->cols_used = (remaining_N < T_N) ? remaining_N: T_N; //max(remaining_N, T_N) 
+	this->cols_used = (remaining_N < T_N) ? remaining_N: T_N; //max(remaining_N, T_N)
 	this->rows_used = (remaining_M < T_M) ? remaining_M: T_M;
 	Tile* tile1 = new Tile(1, 1, 1, cols_used, 1, 1, rows_used, 1, false);
 	this->multiplier_network->resetSignals();
@@ -129,19 +145,42 @@ void OSMeshSDMemory::cycle() {
 	this->multiplier_network->configureSignals(tile1, this->dnn_layer, this->ms_rows, this->ms_cols);
 	this->reduce_network->configureSignals(tile1, this->dnn_layer, this->ms_rows*this->ms_cols, this->iter_K);
 	iteration_completed=false;
+
+	// Sparse-Animator: latch tile base coords for this tile; used by MultiplierOS
+	// until the next OS_CONFIGURING so pipeline-drain MACs stay in-bounds.
+	if (_sa_fp) {
+	    _sa_tile_base_row = (int)(current_M * T_M);
+	    _sa_tile_base_col = (int)(current_N * T_N);
+	    g_sa_hook.base_row = _sa_tile_base_row;
+	    g_sa_hook.base_col = _sa_tile_base_col;
+	    snprintf(_sa_buf, sizeof(_sa_buf),
+	             "{\"matrix\":\"C\",\"kind\":\"processing\",\"tile\":[%d,%d]}",
+	             _sa_tile_base_row, _sa_tile_base_col);
+	    _sa_tile_events.push_back(std::string(_sa_buf));
+	}
     }
 
     if(current_state == OS_DIST_INPUTS) {
        //Distribution of the stationary matrix
        unsigned int dest = 0; //MS destination
-      
-   
-       //SENDING N PACKAGES 
+
+       // Sparse-Animator: accumulate KN and MK read coords
+       std::string _sa_kn_coords, _sa_mk_coords;
+       bool _sa_kn_first = true, _sa_mk_first = true;
+
+       //SENDING N PACKAGES
        for(int i=0; i<this->cols_used; i++) {
 	   data_t data;//Accessing to memory
 	   int index_N=current_N*T_N;
-	   data = this->KN_address[(index_N+i)*this->K + this->current_K]; //Notice that in dense operation the KN matrix is actually NK 
-	   sdmemoryStats.n_SRAM_weight_reads++;  
+	   data = this->KN_address[(index_N+i)*this->K + this->current_K]; //Notice that in dense operation the KN matrix is actually NK
+	   sdmemoryStats.n_SRAM_weight_reads++;
+	   // Sparse-Animator: collect KN read coord
+	   if (_sa_fp) {
+	       if (!_sa_kn_first) _sa_kn_coords += ",";
+	       snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", (int)current_K, (int)(current_N*T_N + i));
+	       _sa_kn_coords += _sa_buf;
+	       _sa_kn_first = false;
+	   }
 	   DataPackage* pck_to_send = new DataPackage(sizeof(data_t), data, WEIGHT, 0, UNICAST, i);
 	   this->sendPackageToInputFifos(pck_to_send);
        }
@@ -150,12 +189,31 @@ void OSMeshSDMemory::cycle() {
        for(int i=0; i<rows_used; i++) {
            data_t data;//Accessing to memory
 	   int index_M=current_M*T_M;
-           data = this->MK_address[(index_M+i)*this->K + this->current_K]; 
-           sdmemoryStats.n_SRAM_input_reads++;  
+           data = this->MK_address[(index_M+i)*this->K + this->current_K];
+           sdmemoryStats.n_SRAM_input_reads++;
+	   // Sparse-Animator: collect MK read coord
+	   if (_sa_fp) {
+	       if (!_sa_mk_first) _sa_mk_coords += ",";
+	       snprintf(_sa_buf, sizeof(_sa_buf), "[%d,%d]", (int)(current_M*T_M + i), (int)current_K);
+	       _sa_mk_coords += _sa_buf;
+	       _sa_mk_first = false;
+	   }
            DataPackage* pck_to_send = new DataPackage(sizeof(data_t), data, IACTIVATION, 0, UNICAST, i+this->ms_cols);
            this->sendPackageToInputFifos(pck_to_send);
        }
 
+       // Sparse-Animator: emit KN and MK read events
+       // MAC events are emitted directly from MultiplierOS::cycle() via g_sa_hook.
+       if (_sa_fp && !_sa_kn_first) {
+           snprintf(_sa_buf, sizeof(_sa_buf),
+                    "{\"matrix\":\"KN\",\"kind\":\"read\",\"coords\":[%s]}", _sa_kn_coords.c_str());
+           _sa_events.push_back(std::string(_sa_buf));
+       }
+       if (_sa_fp && !_sa_mk_first) {
+           snprintf(_sa_buf, sizeof(_sa_buf),
+                    "{\"matrix\":\"MK\",\"kind\":\"read\",\"coords\":[%s]}", _sa_mk_coords.c_str());
+           _sa_events.push_back(std::string(_sa_buf));
+       }
 
        this->current_K+=1;
        if(this->current_K == this->iter_K) {
@@ -186,8 +244,16 @@ void OSMeshSDMemory::cycle() {
 	    unsigned int current_tile_N_pointer = (n_iterations_completed % this->iter_N)*T_N;
 	    unsigned int vn_M_pointer = vn / this->cols_used;
 	    unsigned int vn_N_pointer = vn % this->cols_used;
-	    unsigned int addr_offset = (current_tile_M_pointer+vn_M_pointer)*this->N + current_tile_N_pointer + vn_N_pointer; 
-	    vnat_table[vn]++; 
+	    unsigned int addr_offset = (current_tile_M_pointer+vn_M_pointer)*this->N + current_tile_N_pointer + vn_N_pointer;
+	    // Sparse-Animator: emit C write event
+	    if (_sa_fp) {
+	        snprintf(_sa_buf, sizeof(_sa_buf),
+	                 "{\"matrix\":\"C\",\"kind\":\"write\",\"coords\":[[%d,%d]]}",
+	                 (int)(current_tile_M_pointer + vn_M_pointer),
+	                 (int)(current_tile_N_pointer + vn_N_pointer));
+	        _sa_events.push_back(std::string(_sa_buf));
+	    }
+	    vnat_table[vn]++;
             this->output_address[addr_offset]=data; //ofmap or psum, it does not matter.
             current_output++;
 	    if((current_output % 10000) == 0) {
@@ -239,6 +305,31 @@ void OSMeshSDMemory::cycle() {
 
 
     this->send();
+    // JSONL flush deferred to flushTracer() so MultiplierOS MAC events are included.
+}
+
+void OSMeshSDMemory::flushTracer() {
+    // Called by Stonne::cycle() after msnet->cycle() so MAC events from
+    // MultiplierOS::cycle() (injected via g_sa_hook) are in _sa_events before we write.
+    g_sa_hook.events = nullptr; // prevent stale writes after this cycle
+    if (_sa_fp) {
+        fprintf(_sa_fp, "{\"type\":\"cycle\",\"cycle\":%u,\"events\":[", _sa_cycle++);
+        for (int i = 0; i < (int)_sa_events.size(); i++) {
+            if (i > 0) fprintf(_sa_fp, ",");
+            fprintf(_sa_fp, "%s", _sa_events[i].c_str());
+        }
+        fprintf(_sa_fp, "]");
+        if (!_sa_tile_events.empty()) {
+            fprintf(_sa_fp, ",\"tile_events\":[");
+            for (int i = 0; i < (int)_sa_tile_events.size(); i++) {
+                if (i > 0) fprintf(_sa_fp, ",");
+                fprintf(_sa_fp, "%s", _sa_tile_events[i].c_str());
+            }
+            fprintf(_sa_fp, "]");
+        }
+        fprintf(_sa_fp, "}\n");
+        fflush(_sa_fp);
+    }
 }
 
 bool OSMeshSDMemory::isExecutionFinished() {

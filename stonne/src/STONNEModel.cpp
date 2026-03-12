@@ -130,9 +130,42 @@ void Stonne::setTracerPath(const char* path, unsigned int nnz_mk, unsigned int n
         return;
     }
     // MK: rows=M, cols=K; KN: rows=K, cols=N; C: rows=M, cols=N
-    unsigned int M_dim = this->dnn_layer->get_K();
-    unsigned int K_dim = this->dnn_layer->get_S();
-    unsigned int N_dim = this->dnn_layer->get_X();
+    // Dimension mapping depends on the memory controller type
+    unsigned int M_dim, K_dim, N_dim;
+    const char* accel_name;
+    switch (stonne_cfg.m_SDMemoryCfg.mem_controller_type) {
+        case SIGMA_SPARSE_GEMM:
+            accel_name = "STONNE-SIGMA";
+            M_dim = this->dnn_layer->get_K();
+            K_dim = this->dnn_layer->get_S();
+            N_dim = this->dnn_layer->get_X();
+            break;
+        case MAGMA_SPARSE_DENSE:
+            accel_name = "STONNE-MAGMA";
+            M_dim = this->dnn_layer->get_N();
+            K_dim = this->dnn_layer->get_C();
+            N_dim = this->dnn_layer->get_K();
+            break;
+        case TPU_OS_DENSE:
+            accel_name = "STONNE-OS-MESH";
+            M_dim = this->dnn_layer->get_X();
+            K_dim = this->dnn_layer->get_S();
+            N_dim = this->dnn_layer->get_K();
+            break;
+        case MAERI_DENSE_WORKLOAD:
+            accel_name = "STONNE-MAERI";
+            // loadDenseGEMM maps M→X, K→S, N→K in the CNN layer
+            M_dim = this->dnn_layer->get_X();
+            K_dim = this->dnn_layer->get_S();
+            N_dim = this->dnn_layer->get_K();
+            break;
+        default:
+            accel_name = "STONNE-SIGMA";
+            M_dim = this->dnn_layer->get_K();
+            K_dim = this->dnn_layer->get_S();
+            N_dim = this->dnn_layer->get_X();
+            break;
+    }
 
     // Build matrix specs — include nnz when provided
     char mk_spec[64], kn_spec[64], c_spec[64];
@@ -147,10 +180,10 @@ void Stonne::setTracerPath(const char* path, unsigned int nnz_mk, unsigned int n
     snprintf(c_spec,  sizeof(c_spec),  "{\"rows\":%u,\"cols\":%u}", M_dim, N_dim);
 
     fprintf(_sa_fp,
-            "{\"type\":\"header\",\"accelerator\":\"STONNE-SIGMA\",\"version\":\"1.0\","
+            "{\"type\":\"header\",\"accelerator\":\"%s\",\"version\":\"1.0\","
             "\"matrices\":{\"MK\":%s,\"KN\":%s,\"C\":%s},"
             "\"metadata\":{}}\n",
-            mk_spec, kn_spec, c_spec);
+            accel_name, mk_spec, kn_spec, c_spec);
     fflush(_sa_fp);
     this->mem->setTracerFp(_sa_fp);
 }
@@ -566,6 +599,7 @@ void Stonne::cycle() {
         this->time_as+=std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         start = std::chrono::steady_clock::now();
         this->msnet->cycle();
+        this->mem->flushTracer(); // write JSONL after PE multiplies have fired
         end = std::chrono::steady_clock::now();
         this->time_ms+=std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         start = std::chrono::steady_clock::now();

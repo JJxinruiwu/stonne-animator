@@ -1,7 +1,9 @@
 //Created by Francisco Munoz-Martinez on 13/06/2019
 
 #include "MSwitch.h"
+#include "SparseAnimatorHook.h"
 #include <assert.h>
+#include <cstdio>
 #include "utility.h"
 /*
 */
@@ -355,6 +357,15 @@ void MSwitch::cycle() { //Computing a cycle
             weight_fifo->push(weight);
             data_t data_read = activation->get_data();
             DataPackage* pck_result = perform_operation_2_operands(activation, weight); //Creating the psum package
+            // Sparse-Animator: emit MAC event at the actual multiply site
+            if (g_sa_hook.events && g_sa_hook.n_cols > 0) {
+                char _sa_buf[128];
+                int row = g_sa_hook.base_row + this->num / g_sa_hook.n_cols;
+                int col = g_sa_hook.base_col + this->num % g_sa_hook.n_cols;
+                snprintf(_sa_buf, sizeof(_sa_buf),
+                         "{\"matrix\":\"C\",\"kind\":\"mac\",\"coords\":[[%d,%d]]}", row, col);
+                g_sa_hook.events->push_back(std::string(_sa_buf));
+            }
             psum_fifo->push(pck_result); //Sending to the output fifo to be read in next cycle
                        //data_t data_read = activation->get_data();
                         //std::cout << "Data Received by MS " << this->num << ": " << data_read << std::endl; 
