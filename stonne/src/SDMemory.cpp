@@ -343,14 +343,15 @@ void SDMemory::cycle() {
     Layer_t _sa_layer_type = dnn_layer->get_layer_type();
     bool _sa_is_gemm = (_sa_fp &&
         (_sa_layer_type == GEMM || _sa_layer_type == FC));
-    // Set up global MAC hook for MSwitch so multiplies emit events here
+    // MAC events are emitted from SDMemory at activation-distribution time (not from
+    // MSwitch) to avoid 1-cycle pipeline lag causing wrong base_row at tile boundaries.
+    // Set n_cols=0 so MSwitch::cycle() skips its own emission.
     if (_sa_is_gemm && this->tile_loaded) {
-        g_sa_hook.events   = &_sa_events;
-        g_sa_hook.base_row = (int)(this->current_X * this->current_tile->get_T_X_());
-        g_sa_hook.base_col = (int)(this->current_K * this->current_tile->get_T_K());
-        g_sa_hook.n_cols   = (int)(this->current_tile->get_T_K());
+        g_sa_hook.events = &_sa_events;
+        g_sa_hook.n_cols = 0; // suppress MSwitch-side emission
     } else {
         g_sa_hook.events = nullptr;
+        g_sa_hook.n_cols = 0;
     }
     /* CHANGES DONE TO SAVE MEMORY */
     unsigned int current_iteration=current_output_pixel / output_psums_per_channel;
@@ -676,11 +677,36 @@ void SDMemory::cycle() {
             }
 
             // Sparse-Animator: emit MK read event
-            // MAC events are emitted directly from MSwitch::cycle() via g_sa_hook.
             if (_sa_is_gemm && !_sa_mk_first) {
                 snprintf(_sa_buf, sizeof(_sa_buf),
                          "{\"matrix\":\"MK\",\"kind\":\"read\",\"coords\":[%s]}", _sa_mk_coords.c_str());
                 _sa_events.push_back(std::string(_sa_buf));
+            }
+            // Sparse-Animator: emit MAC events for every (M_row, N_col) pair
+            // being computed this cycle.  Emitting here (at activation distribution)
+            // rather than in MSwitch avoids the 1-cycle pipeline lag that would put
+            // stale base_row/col into the hook at M-tile boundaries.
+            // M dimension = T_X_ (CNN output pixels); N dimension = T_K (CNN filters).
+            if (_sa_is_gemm && !_sa_mk_first) {
+                std::string mac_coords;
+                bool mac_first = true;
+                unsigned idx_X = current_X * current_tile->get_T_X_();
+                unsigned idx_K = current_K * current_tile->get_T_K();
+                for (unsigned mx = 0; mx < current_tile->get_T_X_(); mx++) {
+                    if (idx_X + mx >= (unsigned)dnn_layer->get_X_()) break;
+                    for (unsigned mk = 0; mk < current_tile->get_T_K(); mk++) {
+                        if (idx_K + mk >= (unsigned)dnn_layer->get_K()) break;
+                        if (!mac_first) mac_coords += ",";
+                        snprintf(_sa_buf, sizeof(_sa_buf), "[%u,%u]", idx_X + mx, idx_K + mk);
+                        mac_coords += _sa_buf;
+                        mac_first = false;
+                    }
+                }
+                if (!mac_first) {
+                    snprintf(_sa_buf, sizeof(_sa_buf),
+                             "{\"matrix\":\"C\",\"kind\":\"mac\",\"coords\":[%s]}", mac_coords.c_str());
+                    _sa_events.push_back(std::string(_sa_buf));
+                }
             }
 
             //TODO iter_X deberia de ser iter_X de inputs, no?
